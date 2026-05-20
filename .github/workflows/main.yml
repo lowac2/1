@@ -4,7 +4,7 @@ on:
   schedule:
     # Run twice a day. Adjust hours (in UTC) as desired.
     # Below runs at 00:00 and 12:00 UTC (which is 6:00 AM and 6:00 PM Bangladesh Standard Time).
-    - cron: '0 2,8,11 * * *'
+    - cron: '11 9 * * *'
   workflow_dispatch:
     # Allows you to trigger this workflow manually from GitHub Actions tab
 
