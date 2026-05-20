@@ -4,6 +4,19 @@ import json
 import time
 from playwright.sync_api import sync_playwright
 
+# Safe print wrapper to handle Unicode encoding errors in Windows terminal
+def safe_print(*args, **kwargs):
+    import builtins
+    safe_args = []
+    for arg in args:
+        if isinstance(arg, str):
+            safe_args.append(arg.encode('ascii', 'backslashreplace').decode('ascii'))
+        else:
+            safe_args.append(str(arg).encode('ascii', 'backslashreplace').decode('ascii'))
+    builtins.print(*safe_args, **kwargs)
+
+print = safe_print
+
 # Global dictionary to store correct option indices mapped by 1-based question number
 correct_options = {}
 
@@ -192,6 +205,9 @@ def run_quiz():
             page.wait_for_timeout(2000)
             
         # Navigation and initialization loop
+        failed_chapters = set() # set of (subject_name, chapter_name)
+        failed_subjects = set() # set of subject_name
+        
         quiz_started = False
         max_attempts = 10
         attempt = 0
@@ -239,30 +255,51 @@ def run_quiz():
                 continue
                 
             # Search subject names to identify targets
-            target_indices = []
-            ict_index = None
+            target_subjects = []
+            ict_subject = None
+            other_subjects = []
             
             for idx in range(sub_count):
                 try:
                     text = subjects.nth(idx).inner_text().strip()
                     if "বাংলা" in text or "কৃষিশিক্ষা" in text or "হিসাববিজ্ঞান" in text:
-                        target_indices.append(idx)
+                        target_subjects.append((idx, text))
                     elif "তথ্য ও যোগাযোগ প্রযুক্তি" in text:
-                        ict_index = idx
+                        ict_subject = (idx, text)
+                    else:
+                        other_subjects.append((idx, text))
                 except Exception:
                     pass
             
+            # Filter out fully failed subjects
+            target_subjects = [s for s in target_subjects if s[1] not in failed_subjects]
+            if ict_subject and ict_subject[1] in failed_subjects:
+                ict_subject = None
+            other_subjects = [s for s in other_subjects if s[1] not in failed_subjects]
+            
             import random
             selected_sub_idx = None
-            if len(target_indices) > 0:
-                selected_sub_idx = random.choice(target_indices)
-                print(f"Found target subjects at indices {target_indices}. Randomly chosen target index: {selected_sub_idx}")
-            elif ict_index is not None:
-                selected_sub_idx = ict_index
-                print(f"Target subjects not found. Falling back to ICT at index {selected_sub_idx}")
+            selected_sub_name = None
+            
+            if len(target_subjects) > 0:
+                chosen = random.choice(target_subjects)
+                selected_sub_idx = chosen[0]
+                selected_sub_name = chosen[1]
+                print(f"Found target subjects. Selected: {repr(selected_sub_name)} (index {selected_sub_idx})")
+            elif ict_subject is not None:
+                selected_sub_idx = ict_subject[0]
+                selected_sub_name = ict_subject[1]
+                print(f"Target subjects not found/failed. Selected ICT: {repr(selected_sub_name)} (index {selected_sub_idx})")
+            elif len(other_subjects) > 0:
+                chosen = random.choice(other_subjects)
+                selected_sub_idx = chosen[0]
+                selected_sub_name = chosen[1]
+                print(f"Falling back to other subject: {repr(selected_sub_name)} (index {selected_sub_idx})")
             else:
-                selected_sub_idx = random.randint(0, sub_count - 1)
-                print(f"Target subjects and ICT not found. Falling back to random subject index: {selected_sub_idx}")
+                print("All available subjects/chapters failed. Resetting failure history...")
+                failed_chapters.clear()
+                failed_subjects.clear()
+                continue
                 
             selected_subject = subjects.nth(selected_sub_idx)
             selected_subject.scroll_into_view_if_needed()
@@ -273,34 +310,70 @@ def run_quiz():
                 page.locator('main h2').wait_for(state="visible", timeout=10000)
             except Exception:
                 print("Failed to load chapters page (h2 not found). Retrying...")
+                failed_subjects.add(selected_sub_name)
                 continue
             page.wait_for_timeout(500)
             
-            # 2. Click on a random chapter
+            # 2. Click on a random chapter / expand accordion if needed
             print("Locating chapters...")
-            chapters = page.locator('main h3')
             try:
-                chapters.first.wait_for(state="visible", timeout=10000)
+                page.locator('main h3').first.wait_for(state="visible", timeout=10000)
             except Exception:
-                print("No chapters visible for this subject. Retrying...")
+                print("No chapters/groups visible for this subject. Retrying...")
+                failed_subjects.add(selected_sub_name)
                 continue
                 
-            count = chapters.count()
-            if count == 0:
-                print("Zero chapters found. Retrying...")
+            top_h3s = page.locator('main h3').all()
+            if len(top_h3s) == 0:
+                print("Zero chapters/groups found. Retrying...")
+                failed_subjects.add(selected_sub_name)
                 continue
                 
-            selected_index = random.randint(0, count - 1)
+            selected_index = random.randint(0, len(top_h3s) - 1)
+            selected_h3 = top_h3s[selected_index]
+            selected_h3_text = selected_h3.inner_text().strip()
             
-            selected_chapter = chapters.nth(selected_index)
-            selected_chapter.scroll_into_view_if_needed()
-            print(f"Found {count} chapters. Clicking randomly selected chapter at index {selected_index}...")
-            selected_chapter.click()
+            selected_h3.scroll_into_view_if_needed()
+            print(f"Clicking chapter/group '{repr(selected_h3_text)}' (index {selected_index})...")
+            selected_h3.click()
             page.wait_for_timeout(1500)
+            
+            selected_chap_name = selected_h3_text
             
             # 3. Click on Quick Practice (দ্রুত প্র্যাকটিস) button
             print("Locating Mode selection dialog...")
             quick_practice_btn = page.locator('button:has-text("দ্রুত প্র্যাকটিস")')
+            
+            # Check if modal opened directly
+            if not quick_practice_btn.is_visible():
+                # If not visible, it might be an accordion that expanded.
+                all_current_h3s = page.locator('main h3').all()
+                sub_chapters = []
+                top_header_texts = [h.inner_text().strip() for h in top_h3s]
+                
+                for h in all_current_h3s:
+                    try:
+                        h_text = h.inner_text().strip()
+                        if h_text not in top_header_texts and h.is_visible():
+                            # Check if this specific sub-chapter has failed previously
+                            if (selected_sub_name, h_text) not in failed_chapters:
+                                sub_chapters.append(h)
+                    except Exception:
+                        pass
+                
+                if len(sub_chapters) > 0:
+                    sub_idx = random.randint(0, len(sub_chapters) - 1)
+                    selected_sub = sub_chapters[sub_idx]
+                    selected_chap_name = selected_sub.inner_text().strip()
+                    selected_sub.scroll_into_view_if_needed()
+                    print(f"Detected expanded accordion. Clicking sub-chapter '{repr(selected_chap_name)}' (index {sub_idx})...")
+                    selected_sub.click()
+                    page.wait_for_timeout(1500)
+                else:
+                    print("No unfailed sub-chapters found. Retrying with different subject/chapter...")
+                    failed_chapters.add((selected_sub_name, selected_h3_text))
+                    continue
+            
             try:
                 quick_practice_btn.wait_for(state="visible", timeout=8000)
                 print("Clicking Quick Practice button...")
@@ -317,11 +390,13 @@ def run_quiz():
                         quiz_started = True
                     else:
                         print("No questions loaded from API. Retrying with a different subject/chapter...")
+                        failed_chapters.add((selected_sub_name, selected_chap_name))
                         
             except Exception:
                 print("Quick Practice button not visible. Taking diagnostic screenshot...")
                 page.screenshot(path=f"mode_error_attempt_{attempt}.png")
-                print("This subject/chapter might be locked or empty. Retrying with a different subject/chapter...")
+                print(f"Chapter '{repr(selected_chap_name)}' under subject '{repr(selected_sub_name)}' failed. Retrying...")
+                failed_chapters.add((selected_sub_name, selected_chap_name))
                 page.wait_for_timeout(1000)
                 
         if not quiz_started:
